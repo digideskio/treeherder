@@ -3,6 +3,8 @@ from abc import (ABCMeta,
                  abstractmethod)
 from collections import namedtuple
 from difflib import SequenceMatcher
+from itertools import izip
+from multiprocessing.dummy import Pool
 
 from django.db.models import (Q,
                               Func,
@@ -77,33 +79,46 @@ class PreciseTestMatcher(Matcher):
         return rv
 
 
+def es_match_line(failure_line):
+    if failure_line.action != "test_result" or not failure_line.message:
+        return
+    match = ESMatch(message={"query": failure_line.message,
+                             "type": "phrase"})
+    search = (TestFailureLine.search()
+              .filter("term", test=failure_line.test)
+              .filter("term", status=failure_line.status)
+              .filter("term", expected=failure_line.expected)
+              .filter("exists", field="best_classification")
+              .query(match))
+    if failure_line.subtest:
+        search = search.filter("term", subtest=failure_line.subtest)
+    try:
+        import time
+        t0 = time.time()
+        resp = search.execute()
+        duration = round(1000 * (time.time() - t0))
+        logger.warning("ElasticSearch query took %dms" % duration)
+    except:
+        logger.error("ElasticSearch lookup failed: %s %s %s %s %s" % (
+            failure_line.test, failure_line.subtest, failure_line.status,
+            failure_line.expected, failure_line.message))
+        raise
+    return resp
+
+
 class ElasticSearchTestMatcher(Matcher):
     """Matcher that looks for existing failures with identical tests, and error
     message that is a good match when non-alphabetic tokens have been removed."""
 
+    def __init__(self, *args, **kwargs):
+        Matcher.__init__(self, *args, **kwargs)
+        self.pool = Pool(4)
+
     @es_connected(default=[])
     def __call__(self, failure_lines):
         rv = []
-        for failure_line in failure_lines:
-            if failure_line.action != "test_result" or not failure_line.message:
-                continue
-            match = ESMatch(message={"query": failure_line.message,
-                                     "type": "phrase"})
-            search = (TestFailureLine.search()
-                      .filter("term", test=failure_line.test)
-                      .filter("term", status=failure_line.status)
-                      .filter("term", expected=failure_line.expected)
-                      .filter("exists", field="best_classification")
-                      .query(match))
-            if failure_line.subtest:
-                search = search.filter("term", subtest=failure_line.subtest)
-            try:
-                resp = search.execute()
-            except:
-                logger.error("Elastic search lookup failed: %s %s %s %s %s" % (
-                    failure_line.test, failure_line.subtest, failure_line.status,
-                    failure_line.expected, failure_line.message))
-                raise
+        responses = self.pool.map(es_match_line, failure_lines)
+        for failure_line, resp in izip(failure_lines, responses):
             scorer = MatchScorer(failure_line.message)
             matches = [(item, item.message) for item in resp]
             best_match = scorer.best_match(matches)
