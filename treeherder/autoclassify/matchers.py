@@ -88,7 +88,7 @@ class ElasticSearchTestMatcher(Matcher):
             if failure_line.action != "test_result" or not failure_line.message:
                 continue
             match = ESMatch(message={"query": failure_line.message,
-                                     "type": "phrase"})
+                                     "operator": "and"})
             search = (TestFailureLine.search()
                       .filter("term", test=failure_line.test)
                       .filter("term", status=failure_line.status)
